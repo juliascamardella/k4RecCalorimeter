@@ -1,6 +1,8 @@
 #include "SimulateSiPMwithContrib.h"
 #include "DD4hep/DD4hepUnits.h"
+#include <algorithm>
 #include <cmath>
+#include <numeric>
 
 DECLARE_COMPONENT(SimulateSiPMwithContrib)
 
@@ -27,9 +29,35 @@ StatusCode SimulateSiPMwithContrib::initialize() {
     return StatusCode::FAILURE;
   }
 
-  if (m_rndmExp.initialize(m_randSvc, Rndm::Exponential(m_scintDecaytime.value())).isFailure()) {
+  if (m_rndmExp.initialize(m_randSvc, Rndm::Exponential(1.0)).isFailure() ||
+      m_rndmFlat.initialize(m_randSvc, Rndm::Flat(0., 1.)).isFailure()) {
     error() << "Couldn't initialize RndmGenSvc!" << endmsg;
     return StatusCode::FAILURE;
+  }
+
+  // scintillation time profile: check and build cumulative distribution of the components
+  const auto& taus = m_scintDecayTimes.value();
+  const auto& fracs = m_scintDecayFractions.value();
+  if (taus.empty() || taus.size() != fracs.size()) {
+    error() << "scintDecayTimes and scintDecayFractions must be non-empty and have the same size" << endmsg;
+    return StatusCode::FAILURE;
+  }
+  const double sumFrac = std::accumulate(fracs.begin(), fracs.end(), 0.);
+  if (sumFrac <= 0.) {
+    error() << "scintDecayFractions must sum to a positive number" << endmsg;
+    return StatusCode::FAILURE;
+  }
+  m_cumFractions.clear();
+  double acc = 0.;
+  for (double f : fracs) {
+    acc += f / sumFrac;
+    m_cumFractions.push_back(acc);
+  }
+  m_cumFractions.back() = 1.; // protect against round-off
+  if (!m_isCherenkov) {
+    for (size_t i = 0; i < taus.size(); ++i)
+      info() << "Scintillation component " << i << ": tau = " << taus[i] << " ns, fraction = "
+             << fracs[i] / sumFrac << endmsg;
   }
 
   // initialize SiPM properties
@@ -46,16 +74,26 @@ StatusCode SimulateSiPMwithContrib::initialize() {
   properties.setRiseTime(m_risetime);
   properties.setSnr(m_snr);
   properties.setPdeType(sipm::SiPMProperties::PdeType::kSimplePde); // this sets PDE to a single number
-  properties.setPde(1.0);
+  properties.setPde(1.0); // PDE (and geometrical efficiency) are already applied in the SIM
   // properties.setPdeSpectrum(m_wavelen, m_sipmEff); // if you want wavelen dependency
 
   // set other parameters if provided
-  for (const auto& [key, value] : m_params.value())
+  for (const auto& [key, value] : m_params.value()) {
+    if (key == "pde" || key == "PDE" || key == "Pde")
+      warning() << "'pde' set in params: PDE is already applied in the SIM, it will be applied twice!" << endmsg;
     properties.setProperty(key, value);
+  }
+
+  // consistency of the time windows
+  const double maxT = (m_maxPeTime.value() > 0.) ? m_maxPeTime.value() : m_gateStart.value() + m_gateL.value();
+  if (maxT >= m_sigLength.value())
+    warning() << "Latest p.e. time considered (" << maxT << " ns) is >= signalLength (" << m_sigLength.value()
+              << " ns): photo-electrons beyond the SimSiPM window will be discarded anyway. Increase signalLength."
+              << endmsg;
 
   m_sensor = std::make_unique<sipm::SiPMSensor>(properties); // must be constructed from SiPMProperties
 
-  info() << "SimulateSiPMwithEdep initialized" << endmsg;
+  info() << "SimulateSiPMwithContrib initialized (isCherenkov = " << m_isCherenkov.value() << ")" << endmsg;
   info() << properties << endmsg; // sipm::SiPMProperties has std::ostream& operator<<
 
   return StatusCode::SUCCESS;
@@ -66,7 +104,12 @@ StatusCode SimulateSiPMwithContrib::execute(const EventContext&) const {
   edm4hep::CalorimeterHitCollection* digiHits = m_digiHits.createAndPut();
   auto* links = m_hitLinks.createAndPut();
 
-  // loop through the hits (each hit corresponds to a fiber)
+  const auto& taus = m_scintDecayTimes.value();
+  const double maxT =
+      std::min((m_maxPeTime.value() > 0.) ? m_maxPeTime.value() : m_gateStart.value() + m_gateL.value(),
+               m_sigLength.value());
+
+  // loop through the hits (each hit corresponds to a crystal / fibre)
   for (unsigned int idx = 0; idx < scintHits->size(); idx++) {
     const auto& scintHit = scintHits->at(idx);
 
@@ -78,6 +121,8 @@ StatusCode SimulateSiPMwithContrib::execute(const EventContext&) const {
     std::vector<double> vecTimes;
     std::vector<double> vecWavelens;
 
+    unsigned long long nTot = 0, nOut = 0;
+
     // loop through the hit contributions
     for (auto contrib = scintHit.contributions_begin(); contrib != scintHit.contributions_end(); ++contrib) {
 
@@ -85,24 +130,43 @@ StatusCode SimulateSiPMwithContrib::execute(const EventContext&) const {
         std::cerr << "ERROR: Hit contribution not available!" << std::endl;
         continue;
       }
-      const double npe = contrib->getEnergy(); // in IDEA_o2 this is the number of photo-electrons
+      // number of photo-electrons: stored as n x GeV in the SIM, converted back to n by the EDM4hep converter
+      // (rounded, to avoid losing a p.e. with a floating-point 2.9999)
+      const long long npe = std::llround(contrib->getEnergy());
+      if (npe <= 0)
+        continue;
 
-      vecTimes.reserve(vecTimes.size() + npe); // resize vector to store new p.e.
-      vecWavelens.reserve(vecTimes.size() + npe);
+      // prompt photon arrival time at SiPM (ns), binned in the SIM
+      const double time = contrib->getTime();
 
-      // get the photon arrival time at SiPM
-      const double time = contrib->getTime(); // in IDEA_o2 this it the toa at SiPM in ns
-      double thisTime = time;
-      // if it is a scintillation hit, add scintillation decay time
-      if (!m_isCherenkov) {
-        thisTime += m_rndmExp.shoot();
-      }
+      vecTimes.reserve(vecTimes.size() + npe);
+      vecWavelens.reserve(vecWavelens.size() + npe);
 
-      for (unsigned int pe = 0; pe < npe; pe++) {
+      for (long long pe = 0; pe < npe; pe++) {
+        double thisTime = time;
+        // scintillation: sample the emission time for EACH p.e. from the multi-exponential profile
+        if (!m_isCherenkov) {
+          const double u = m_rndmFlat.shoot();
+          size_t k = 0;
+          while (k + 1 < m_cumFractions.size() && u > m_cumFractions[k])
+            ++k;
+          thisTime += taus[k] * m_rndmExp.shoot();
+        }
+        ++nTot;
+        if (thisTime >= maxT) { // cannot contribute to the gate, and is outside the SimSiPM window
+          ++nOut;
+          continue;
+        }
         vecTimes.push_back(thisTime);
         vecWavelens.push_back(1.); // photons wavelengths are dummy, we are using photo-electrons
       }
     } // contrib
+
+    m_nPeTotal += nTot;
+    m_nPeOutOfWindow += nOut;
+
+    if (vecTimes.empty())
+      continue;
 
     // sort time of arrivals from shortest to longest
     std::sort(vecTimes.begin(), vecTimes.end());
@@ -130,8 +194,8 @@ StatusCode SimulateSiPMwithContrib::execute(const EventContext&) const {
       continue;
 
     auto digiHit = digiHits->create();
-    digiHit.setEnergy(integral /* * m_scaleADC.value()*/); // convertition from ADC to GeV can be added here
-    digiHit.setEnergyError(/*m_scaleADC.value() **/ std::sqrt(integral));
+    digiHit.setEnergy(integral * m_scaleADC.value()); // conversion from ADC to GeV
+    digiHit.setEnergyError(m_scaleADC.value() * std::sqrt(integral));
     digiHit.setPosition(scintHit.getPosition());
     digiHit.setCellID(scintHit.getCellID());
     // Toa and m_gateStart are in ns
@@ -145,4 +209,11 @@ StatusCode SimulateSiPMwithContrib::execute(const EventContext&) const {
   return StatusCode::SUCCESS;
 }
 
-StatusCode SimulateSiPMwithContrib::finalize() { return Gaudi::Algorithm::finalize(); }
+StatusCode SimulateSiPMwithContrib::finalize() {
+  const auto tot = m_nPeTotal.load();
+  if (tot > 0)
+    info() << "Photo-electrons discarded because later than " << (m_maxPeTime.value() > 0. ? m_maxPeTime.value() : m_gateStart.value() + m_gateL.value())
+           << " ns: " << m_nPeOutOfWindow.load() << " / " << tot << " ("
+           << 100. * double(m_nPeOutOfWindow.load()) / double(tot) << " %)" << endmsg;
+  return Gaudi::Algorithm::finalize();
+}
